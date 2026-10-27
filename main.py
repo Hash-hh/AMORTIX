@@ -25,7 +25,7 @@ from config import MoleculeConfig
 from core.gumbeldore_dataset import GumbeldoreDataset
 from model.molecule_transformer import MoleculeTransformer, dict_to_cpu
 from molecule_evaluator import CentralOracle, RemoteEvaluatorProxy
-from rl_updates import dr_grpo_update
+from rl_updates import dr_grpo_update, ppo_update
 import chem_utils
 
 
@@ -201,11 +201,17 @@ def train_for_one_epoch_rl(epoch: int,
         network.virtual_atom_linear.bias.requires_grad = True
         network.bond_atom_linear.weight.requires_grad = True
         network.bond_atom_linear.bias.requires_grad = True
+        # PPO: also unfreeze the value head (critic)
+        if getattr(config, 'rl_algorithm', 'grpo') == 'ppo':
+            for p in network.value_head.parameters():
+                p.requires_grad = True
 
     network.train()
 
     print("training ...")
-    metrics = dr_grpo_update(
+    rl_algo = getattr(config, 'rl_algorithm', 'grpo').lower()
+    update_fn = ppo_update if rl_algo == "ppo" else dr_grpo_update
+    metrics = update_fn(
         model=network,
         optimizer=optimizer,
         designs_groups=trajectories,
@@ -214,7 +220,7 @@ def train_for_one_epoch_rl(epoch: int,
         logger=None,
         novelty_memory=novelty_memory
     )
-    print("dr GRPO update done.")
+    print("PPO update done." if rl_algo == "ppo" else "dr GRPO update done.")
     metrics["best_gen_obj"] = metrics.get("best_objective", float("-inf"))
     metrics["mean_best_gen_obj"] = metrics.get("mean_reward", float("-inf"))
 
@@ -349,6 +355,10 @@ if __name__ == '__main__':
     parser.add_argument('--rl_ppo_clip_epsilon', type=float,
                         default=temp_config_for_defaults.rl_ppo_clip_epsilon,
                         help='GRPO clipping epsilon')
+    parser.add_argument('--rl_algorithm', type=str,
+                        default=temp_config_for_defaults.rl_algorithm,
+                        choices=['grpo', 'ppo'],
+                        help="RL algorithm: 'grpo' (per-group baseline) or 'ppo' (actor-critic, global baseline)")
     del temp_config_for_defaults  # Clean up temporary config
 
     args = parser.parse_args()
@@ -361,6 +371,7 @@ if __name__ == '__main__':
     config.rl_entropy_beta = args.rl_entropy_beta
     config.ppo_epochs = args.ppo_epochs
     config.rl_ppo_clip_epsilon = args.rl_ppo_clip_epsilon
+    config.rl_algorithm = args.rl_algorithm
 
     # --- WANDB INITIALIZATION ---
     if hasattr(config, 'use_wandb') and config.use_wandb:
@@ -388,6 +399,7 @@ if __name__ == '__main__':
         config.rl_ppo_clip_epsilon = wandb.config.get('rl_ppo_clip_epsilon', config.rl_ppo_clip_epsilon)
 
         wandb.config.update({"task": config.objective_type}, allow_val_change=True)
+        wandb.config.update({"rl_algorithm": config.rl_algorithm}, allow_val_change=True)
         # wandb.config.update({"task": config.objective_type})  # Log the task separately for easy filtering
 
     num_gpus = len(config.CUDA_VISIBLE_DEVICES.split(","))
@@ -482,7 +494,12 @@ if __name__ == '__main__':
             "best_validation_metric": float("-inf")
         }
     if checkpoint["model_weights"] is not None:
-        network.load_state_dict(checkpoint["model_weights"])
+        # strict=False: pretrained checkpoints predate the PPO value head, which stays randomly initialised
+        missing, unexpected = network.load_state_dict(checkpoint["model_weights"], strict=False)
+        if missing:
+            print(f"[Checkpoint] New parameters initialised randomly (not in checkpoint): {missing}")
+        if unexpected:
+            print(f"[Checkpoint] Unexpected keys in checkpoint (ignored): {unexpected}")
 
     print(f"Policy network is on device {config.training_device}")
     network.to(network.device)
@@ -617,16 +634,19 @@ if __name__ == '__main__':
                     print(
                         f">> Stalling detected ({recent_new_calls} unique in last 10 epochs). Increasing Entropy.")
 
-                    # increase entropy to force exploration
-                    current_rl_entropy_beta = config.rl_entropy_beta
-                    if current_rl_entropy_beta < 0.01: # Increase to a max of 0.01
-                        config.rl_entropy_beta = current_rl_entropy_beta + 0.001
+                    # increase entropy to force exploration (PPO bumps its own coefficient, GRPO bumps rl_entropy_beta)
+                    entropy_attr, entropy_cap = (
+                        ("ppo_entropy_coeff", 0.02) if config.rl_algorithm == "ppo" else ("rl_entropy_beta", 0.01)
+                    )
+                    current_entropy = getattr(config, entropy_attr)
+                    if current_entropy < entropy_cap:  # Increase up to the cap
+                        setattr(config, entropy_attr, round(current_entropy + 0.001, 6))
                     else:
                         # We have still stalled despite a high entropy bonus, it's time to terminate RL
-                        print(f">> High Entropy ({current_rl_entropy_beta:.4f}) insufficient to resolve stalling. Switching to TASAR for inference.")
+                        print(f">> High Entropy ({current_entropy:.4f}) insufficient to resolve stalling. Switching to TASAR for inference.")
                         rl_terminated = True
 
-                    print(f">> New Entropy Beta: {config.rl_entropy_beta:.4f}")
+                    print(f">> New Entropy Coefficient ({entropy_attr}): {getattr(config, entropy_attr):.4f}")
                     # Reset history to give the new entropy setting time to work
                     unique_calls_history = []
 
@@ -859,6 +879,7 @@ if __name__ == '__main__':
                         'mean_advantage',
                         'std_advantage',
                         'policy_loss',
+                        'value_loss',
                         'mean_entropy',
                         'mean_traj_length',
                         'num_trajectories'
@@ -973,7 +994,7 @@ if __name__ == '__main__':
         best_ckpt_path = os.path.join(config.results_path, "best_model.pt")
         if os.path.exists(best_ckpt_path):
             checkpoint = torch.load(best_ckpt_path)
-            network.load_state_dict(checkpoint["model_weights"])
+            network.load_state_dict(checkpoint["model_weights"], strict=False)
         else:
             print("WARNING: best_model.pt not found; using last model.")
 

@@ -140,7 +140,7 @@ class MoleculeConfig:
             "batch_size_per_worker": 1,  # Keep at one, as we only have three atoms from which we can start
             "batch_size_per_cpu_worker": 1,
 
-            "search_type": "wor",  # "beam_search" | "tasar" | "iid_mc", "wor"
+            "search_type": "iid_mc",  # "beam_search" | "tasar" | "iid_mc", "wor"
             # "search_type": "tasar",
             "num_samples_per_instance": 128,  # For 'iid_mc': number of IID samples to generate per starting instance
             "sampling_temperature": 1,  # For 'iid_mc': temperature for sampling. >1 is more random.
@@ -170,7 +170,8 @@ class MoleculeConfig:
 
         # --- Dr. GRPO / RL fine-tuning baseline configuration ---
 
-        self.use_dr_grpo = True  # Enable RL fine-tuning (vs pure supervised)
+        self.use_dr_grpo = True  # Enable RL fine-tuning (vs pure supervised); also gates the PPO path
+        self.rl_algorithm = "ppo"  # "ppo" = actor-critic with learned value baseline, "grpo" = per-group mean baseline
 
         self.max_size_hof = 1  # Maximum size of the Hall of Fame (HoF)
         self.similarity_threshold_hof = 0.75  # Tanimoto similarity threshold for HoF updates
@@ -187,9 +188,14 @@ class MoleculeConfig:
         # or
         # self.gumbeldore_config["beam_width"] = ... (for wor/tasar)
 
-        self.ppo_epochs = 1  # Number of GRPO iterations per RL update, for now keep 1 for simplicity (REINFORCE with baseline)
+        self.ppo_epochs = 1  # Number of optimisation passes per RL update (GRPO: keep 1; PPO: typically 3-10)
 
         self.rl_ppo_clip_epsilon = 0.2  # PPO clipping parameter
+
+        # --- PPO Actor-Critic specific ---
+        self.ppo_vf_coeff = 0.5  # c1: weight of value-function loss in total PPO loss
+        self.ppo_entropy_coeff = 0.  # c2: weight of entropy bonus in total PPO loss
+        # self.ppo_entropy_coeff = 0.01  # c2: weight of entropy bonus in total PPO loss
 
         # self.rl_entropy_beta = 0.0
         # self.rl_entropy_beta = 0.0015
@@ -198,7 +204,9 @@ class MoleculeConfig:
         # self.rl_entropy_beta = 0.001
         self.rl_entropy_beta = float(os.environ.get("RL_ENTROPY_BETA", "0.0"))
 
-        entropy_str = str(self.rl_entropy_beta).replace(".", "p")
+        # Name runs after the entropy coefficient that is actually active for the chosen algorithm
+        active_entropy = self.ppo_entropy_coeff if self.rl_algorithm == "ppo" else self.rl_entropy_beta
+        entropy_str = str(active_entropy).replace(".", "p")
 
         # Create a unique folder name
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
@@ -209,9 +217,9 @@ class MoleculeConfig:
 
         # --- WandB Logging ---
         self.use_wandb = True  # Master switch for WandB logging
-        self.wandb_project = "graphxform-rl-battery-chembl"
-        self.wandb_entity = ""  # wandb username or team name
-        self.wandb_run_name = f"{self.objective_type}_wor_ent_{entropy_str}_runID_{run_id}"
+        self.wandb_project = "amortix_pmo_ppo"
+        self.wandb_entity = "mbinjavaid-rwth-aachen-university"  # wandb username or team name
+        self.wandb_run_name = f"{self.objective_type}_{self.rl_algorithm}_{self.gumbeldore_config['search_type']}_ent_{entropy_str}_runID_{run_id}"
 
         self.rl_use_novelty_bonus = False  # Master switch to enable/disable novelty
         self.rl_novelty_beta = 0.05  # The coefficient for the novelty bonus
