@@ -226,6 +226,7 @@ class MoleculeConfig:
 
         self.rl_use_il_distillation = False
 
+
         # Core RL control
         self.rl_replay_microbatch_size = 32  # Streaming microbatch size (0/None => process all trajectories together)
         # self.rl_replay_microbatch_size = 64  # Streaming microbatch size (0/None => process all trajectories together)
